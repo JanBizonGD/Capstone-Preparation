@@ -1,0 +1,514 @@
+---
+- hosts: localhost
+  gather_facts: no
+  connection: local
+  name: Create Infrastructure
+  vars:
+    resourceGroup: # Pass via commandline
+    networkName: jenkinsNetwork
+    subnetName: jenkinsMasterSubnet
+  tasks:
+    - name: Register resource group name
+      ansible.builtin.set_fact:
+        resourceGroup: "{{ resourceGroup }}"
+    - name: Create a virtual network
+      azure.azcollection.azure_rm_virtualnetwork:
+        resource_group: "{{ resourceGroup }}"
+        name: "{{ networkName }}"
+        address_prefixes_cidr:
+          - 10.1.0.0/16
+    - name: Create a subnet
+      azure.azcollection.azure_rm_subnet:
+        resource_group: "{{ resourceGroup }}"
+        virtual_network_name: "{{ networkName }}"
+        name: "{{ subnetName }}"
+        address_prefix_cidr: "10.1.0.0/24"
+    - name: Create instance
+      azure.azcollection.azure_rm_virtualmachine:
+        name: Jenkins-Master
+        resource_group: "{{ resourceGroup }}"
+        admin_username: "azureuser"
+          #vm_size: Standard_B1s
+          #image:
+          # offer: 0001-com-ubuntu-server-focal
+          # publisher: canonical
+          #sku: 20_04-lts
+          #version: latest
+        vm_size: Standard_D2s_v3
+        managed_disk_type: Standard_LRS
+        boot_diagnostics:
+          enabled: false
+        image:
+          offer: ubuntu-24_04-lts
+          publisher: canonical
+          sku: server
+          version: latest
+        ssh_password_enabled: false
+        ssh_public_keys:
+          - path: /home/azureuser/.ssh/authorized_keys
+            key_data: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINitgvUOOsLTtC+dXKW/JMj5k0WRbWKFjO/Gmxk3G4nG root@cc628986515d"
+    - name: Security group
+      ansible.builtin.set_fact:
+        securityGroup: "{{ ansible_facts['azure_vm']['network_profile']['network_interfaces'][0]['properties']['network_security_group']['id'] }}"
+    - name: Add rules to security group
+      azure_rm_securitygroup:
+        resource_group: "{{ resourceGroup }}"
+        name: "{{ securityGroup | basename }}"
+        rules:
+          - name: Allow-custom
+            protocol: Tcp
+            destination_port_range: 8080
+            access: Allow
+            priority: 2001
+            direction: Inbound
+          - name: Allow-http
+            protocol: Tcp
+            destination_port_range: 80
+            access: Allow
+            priority: 2002
+            direction: Inbound
+          - name: Allow-8050
+            protocol: Tcp
+            destination_port_range: 8050
+            access: Allow
+            priority: 2003
+            direction: Inbound
+
+    - name: Get facts for one Public IP
+      azure.azcollection.azure_rm_publicipaddress_info:
+        resource_group: "{{ resourceGroup }}"
+        name: "{{ ansible_facts['azure_vm']['network_profile']['network_interfaces'][0]['properties']['ip_configurations'][0]['public_ip_address']['name'] }}"
+      register: public_ip_info
+    - name: Print public IP
+      ansible.builtin.debug:
+        msg: "Public Master IP: {{ public_ip_info['publicipaddresses'][0]['ip_address'] }}"
+    - name: Set facts
+      ansible.builtin.set_fact:
+        jenkinsIp: "{{ public_ip_info['publicipaddresses'][0]['ip_address'] }}"
+    - name: Add Jenkins master node
+      ansible.builtin.add_host:
+        hostname: "master"
+        groups: jenkins
+        ansible_host: "{{ jenkinsIp }}"
+        ansible_ssh_private_key_file: "/root/.ssh/jenkins-master"
+        ansible_user: "azureuser"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+    - name: Create agent instance
+      azure.azcollection.azure_rm_virtualmachine:
+        name: Jenkins-Slave
+        resource_group: "{{ resourceGroup }}"
+        admin_username: "azureuser"
+        subnet_name: "{{ subnetName }}"
+        virtual_network_name: "{{ networkName }}"
+        vm_size: Standard_D2s_v3
+        managed_disk_type: Standard_LRS
+        boot_diagnostics:
+          enabled: false
+        image:
+          offer: ubuntu-24_04-lts
+          publisher: canonical
+          sku: server
+          version: latest
+        ssh_password_enabled: false
+        ssh_public_keys:
+          - path: /home/azureuser/.ssh/authorized_keys
+            key_data: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINitgvUOOsLTtC+dXKW/JMj5k0WRbWKFjO/Gmxk3G4nG root@cc628986515d"
+    - name: Get facts for one Public IP
+      azure.azcollection.azure_rm_publicipaddress_info:
+        resource_group: "{{ resourceGroup }}"
+        name: "{{ ansible_facts['azure_vm']['network_profile']['network_interfaces'][0]['properties']['ip_configurations'][0]['public_ip_address']['name'] }}"
+      register: slave_ip_info
+    - name: Set slave facts
+      ansible.builtin.set_fact:
+        slaveIp: "{{ slave_ip_info['publicipaddresses'][0]['ip_address'] }}"
+    - name: Print public IP
+      ansible.builtin.debug:
+        msg: "Public Slave IP: {{ slave_ip_info['publicipaddresses'][0]['ip_address'] }}"
+    - name: Add Jenkins slave node
+      ansible.builtin.add_host:
+        hostname: "slave"
+        groups: jenkins
+        ansible_host: "{{ slaveIp }}"
+        ansible_ssh_private_key_file: "/root/.ssh/jenkins-master"
+        ansible_user: "azureuser"
+        ansible_ssh_extra_args: '-o StrictHostKeyChecking=no'
+
+
+          # TODO: specify with parameter
+- hosts: localhost
+  connection: local
+  vars:
+    jenkinsIp: "{{ hostvars['localhost']['jenkinsIp'] }}"
+    jenkinsPort: "8080"
+    accessToken: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+    repoOwner: "JanBizonGD"
+    repoName: "Capstone-Project"
+    secret: "Password123!"
+    token: "abc123"
+  tasks:
+    - name: Check if Github webhook exist
+      ansible.builtin.uri:
+        return_content: yes
+        url: "https://api.github.com/repos/{{ repoOwner }}/{{ repoName }}/hooks"
+        method: "GET"
+        body_format: "json"
+        headers:
+          Authorization: "Bearer {{ accessToken }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "2022-11-28"
+      register: webHooksList
+
+    - name: Register jenkins uri
+      ansible.builtin.set_fact:
+        webHookURI: "http://{{ jenkinsIp }}:{{ jenkinsPort }}//generic-webhook-trigger/invoke?token={{ token }}"
+          #"http://{{ jenkinsIp }}:{{ jenkinsPort }}//github-webhook/"
+
+    - name: If webhook exist
+      ansible.builtin.set_fact:
+        webHookExist : "{{ webHooksList.json | json_query('[*].\"config\".\"url\"') | intersect([ webHookURI ]) | length }}"
+          #select('search', webHookURI) | list
+    - name: Register Github webhook
+      when: webHookExist == "0"
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/{{ repoOwner }}/{{ repoName }}/hooks"
+        method: "POST"
+        body_format: "json"
+        status_code: 201
+        headers:
+          Authorization: "Bearer {{ accessToken }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "2022-11-28"
+        body:
+          name: "web"
+          active: true
+          events: ["push", "pull_request"]
+          config:
+            url: "http://{{ jenkinsIp }}:{{ jenkinsPort }}//generic-webhook-trigger/invoke?token={{ token }}"
+            content_type: "json"
+            insecure_ssl: 0
+            secret: "{{ secret }}"
+
+              #url: "http://{{ jenkinsIp }}:{{ jenkinsPort }}//github-webhook/"
+
+
+
+- hosts: localhost
+  connection: local
+  vars:
+    containerName: petclinicimage
+    resourceGroup: "{{ hostvars['localhost']['resourceGroup'] }}"
+    accountName:  storageaccount558739
+  tasks:
+    - name: Create storage account
+      azure_rm_storageaccount:
+        resource_group: "{{ resourceGroup }}"
+        name: "{{ accountName }}"
+        account_type: "Standard_LRS"
+    - name: Extract account names
+      ansible.builtin.set_fact:
+        accountName: "{{ accountName }}"
+          #  - name: Get resource group resources
+          #    ansible.builtin.azure_rm_resource_info:
+          #      resource_group: "{{ resourceGroup }}"
+          #      provider: "Storage"
+          #      resource_type: "storageAccounts"
+          #    register: resources
+          #  - name: Display accountName
+          #    ansible.builtin.debug:
+          #      msg: "Account name: {{ accountName }}"
+    - name: Create blob storage
+      azure_rm_storageblob:
+        resource_group: "{{ resourceGroup }}"
+        container: "{{ containerName }}"
+        storage_account_name: "{{ accountName }}"
+
+
+
+- hosts: master
+  name: Setup Jenkins
+  gather_facts: no
+  become: true
+  become_method: sudo
+  vars_files:
+    - secret.yml
+  vars:
+    vmUsername: "adminuser"
+    vmPassword: "Password123!"
+    dbUsername: "azureuser"
+    dbPassword: "Password123!"
+
+    javaHome: /usr/lib/jvm/default-java
+    jenkinsUser: admin
+    azureClientId: "{{ lookup('env', 'AZURE_CLIENT_ID') }}"
+    azureClientSecret: "{{ lookup('env', 'AZURE_SECRET') }}"
+    azureResourceGroup: "{{ hostvars['localhost']['resourceGroup'] }}"
+    azureStorageAccount: "{{ hostvars['localhost']['accountName'] }}"
+    azureSubscriptionId: "{{ lookup('env', 'AZURE_SUBSCRIPTION_ID') }}"
+    azureTenantId: "{{ lookup('env', 'AZURE_TENANT') }}"
+    GITHUB_TOKEN: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+  tasks:
+    - name: Update repository
+      ansible.builtin.apt:
+        update_cache: yes
+        name:
+          - wget
+          - curl
+    - name: Install Java
+      ansible.builtin.apt:
+        name: openjdk-21-jre
+    - name: Java home
+      ansible.builtin.shell:
+        cmd: "export JAVA_HOME={{ javaHome }}"
+    - name: Import repo
+      ansible.builtin.get_url:
+        url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+        dest: /etc/apt/trusted.gpg.d/jenkins-keyring.asc
+        mode: '0644'
+        force: true
+    - name: Add repo
+      ansible.builtin.apt_repository:
+        repo: "deb https://pkg.jenkins.io/debian-stable binary/"
+        state: present
+    - name: Install jenkins
+      ansible.builtin.apt:
+        name: jenkins
+    - name: Enable and start jenkins
+      ansible.builtin.systemd_service:
+        enabled: true
+        state: started
+        name: jenkins
+    - name: Set defaults for Jenkins
+      ansible.builtin.template:
+        src: jenkins_default
+        dest: /var/lib/jenkins/jenkins.install.UpgradeWizard.state
+    - name: Create init folder
+      ansible.builtin.file:
+        path: /var/lib/jenkins/init.groovy.d/
+        state: directory
+
+    - name: Set login and password
+      ansible.builtin.template:
+        src: security.groovy
+        dest: /var/lib/jenkins/init.groovy.d/basic-security.groovy
+
+    - name: Enable and start jenkins
+      ansible.builtin.systemd_service:
+        enabled: true
+        state: restarted
+        name: jenkins
+
+    - name: Get Jenkins CLI
+      ansible.builtin.get_url:
+        url: http://localhost:8080/jnlpJars/jenkins-cli.jar
+        dest: /root/jenkins-cli.jar
+
+    - name: Auth for Jenkins CLI
+      ansible.builtin.template:
+        src: jenkinspluginauth
+        dest: /root/jenkinsauth
+
+    - name: Install Plugins
+      ansible.builtin.shell:
+        cmd: java -jar /root/jenkins-cli.jar -s http://localhost:8080 -auth @/root/jenkinsauth install-plugin github dashboard-view configuration-as-code build-timeout rebuild ssh-agent timestamper ws-cleanup repo ssh-slaves workflow-aggregator ansicolor github-branch-source groovy copyartifact pipeline-utility-steps generic-webhook-trigger git-parameter
+
+    - name: Load Jenkins configuration
+      ansible.builtin.template:
+        src: ./templates/config.yml
+        dest: /var/lib/jenkins/jenkins.yaml
+
+    - name: Add Jenkins environment variables
+      ansible.builtin.replace:
+        path: /var/lib/jenkins/jenkins.yaml
+        regexp: '\$\{AZURE_RESOURCE_GROUP\}'
+        replace: "{{ azureResourceGroup }}"
+    - name: Add Jenkins environment variables
+      ansible.builtin.replace:
+        path: /var/lib/jenkins/jenkins.yaml
+        regexp: '\$\{AZURE_STORAGE_ACCOUNT\}'
+        replace: "{{ azureStorageAccount }}"
+    - name: Add Jenkins environment variables
+      ansible.builtin.replace:
+        path: /var/lib/jenkins/jenkins.yaml
+        regexp: '\$\{AZURE_SUBSCRIPTION_ID\}'
+        replace: "{{ azureSubscriptionId }}"
+    - name: Add Jenkins environment variables
+      ansible.builtin.replace:
+        path: /var/lib/jenkins/jenkins.yaml
+        regexp: '\$\{AZURE_TENANT_ID\}'
+        replace: "{{ azureTenantId }}"
+
+    - name: Add credentials
+      ansible.builtin.template:
+        src: credentials.groovy.j2
+        dest: /var/lib/jenkins/init.groovy.d/init-cred.groovy
+    - name: Create directory
+      ansible.builtin.file:
+        path: "/var/lib/jenkins/jobs/Infrastructure"
+        state: directory
+        owner: jenkins
+        group: jenkins
+    - name: Create directory
+      ansible.builtin.file:
+        path: "/var/lib/jenkins/jobs/DeployProject"
+        state: directory
+        owner: jenkins
+        group: jenkins
+    - name: Copy job description
+      ansible.builtin.template:
+        src: ./templates/job.xml
+        dest: /var/lib/jenkins/jobs/Infrastructure/config.xml
+        mode: '666'
+    - name: Copy job description
+      ansible.builtin.template:
+        src: ./templates/job2.xml
+        dest: /var/lib/jenkins/jobs/DeployProject/config.xml
+        mode: '666'
+
+    - name: Restart Jenkins
+      ansible.builtin.systemd_service:
+        state: restarted
+        name: jenkins
+
+
+
+- hosts: slave
+  name: Setup Jenkins Agent
+  gather_facts: false
+  become: true
+  become_method: sudo
+  vars_files:
+    - secret.yml
+  vars:
+    javaHome: /usr/lib/jvm/default-java
+    user: azureuser
+    jenkinsURL: "{{ hostvars['localhost']['jenkinsIp'] }}"
+    secret: "abc123"
+    mavenVersion: 3.9.9
+  tasks:
+    - name: Install tools
+      ansible.builtin.apt:
+        update_cache: yes
+        name:
+          - wget
+          - openjdk-17-jdk
+          - git
+          - python3-semver
+    - name: Prepare directories
+      ansible.builtin.file:
+        path: /opt/jenkins
+        state: directory
+    - name: Prepare directories
+      ansible.builtin.file:
+        path: "/home/{{ user }}/inbound-agent"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+    - name: Decompress Maven
+      ansible.builtin.unarchive:
+        src: "https://archive.apache.org/dist/maven/maven-3/{{ mavenVersion }}/binaries/apache-maven-{{ mavenVersion }}-bin.tar.gz"
+        dest: "/opt/"
+        remote_src: yes
+    - name: Make link
+      ansible.builtin.file:
+        src: "/opt/apache-maven-{{ mavenVersion }}/bin/mvn"
+        dest: /usr/bin/mvn
+        state: link
+    - name: Get Agent
+      ansible.builtin.get_url:
+        url: "http://{{ jenkinsURL }}:8080/jnlpJars/agent.jar"
+        dest: "/home/{{ user }}/inbound-agent"
+    - name: Copy service configuration
+      ansible.builtin.template:
+        src: ./templates/jenkins-agent.service
+        dest: /etc/systemd/system/jenkins-agent.service
+    - name: Insert URL
+      ansible.builtin.replace:
+        path: /etc/systemd/system/jenkins-agent.service
+        regexp: '\$\{AGENT_IP\}'
+        replace: "{{ jenkinsURL }}"
+    - name: Retrive password for agent
+      ansible.builtin.shell:
+        curl -L -s -u admin:{{ secret }} http://{{ jenkinsURL }}:8080//computer/Jenkins-Slave/jenkins-agent.jnlp | sed "s/.*<application-desc><argument>\([a-z0-9]*\).*/\1\n/" > agent-secret
+      args:
+        chdir: "/home/{{ user }}/inbound-agent"
+    - name: Reload daemon
+      ansible.builtin.systemd_service:
+        name: jenkins-agent
+        daemon_reload: true
+        enabled: yes
+        state: started
+
+    - name: Install tools for terraform
+      ansible.builtin.apt:
+        update_cache: yes
+        name:
+          - gnupg
+          - software-properties-common
+            #- name: Get terraform repository
+            #  ansible.builtin.get_url:
+            #    url: https://apt.releases.hashicorp.com/gpg
+            #    dest: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            #    mode: '0644'
+            #    force: true
+            #    - name: Add HashiCorp GPG key
+            #      ansible.builtin.apt_key:
+            #        url: "https://apt.releases.hashicorp.com/gpg"
+            #        keyring: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            #        state: present
+    - name: Add HashiCorp GPG key
+      ansible.builtin.shell:
+        cmd: |
+          wget -O- https://apt.releases.hashicorp.com/gpg | \
+          gpg --dearmor | \
+          sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+    - name: Version
+      ansible.builtin.shell:
+        cmd: "lsb_release -cs"
+      register: systemVersion
+    - name: Add terraform repo
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com {{ systemVersion.stdout }} main"
+        filename: hashicorp
+        state: present
+    - name: Install terraform
+      ansible.builtin.apt:
+        name: terraform
+    - name: Install Az cli
+      ansible.builtin.shell:
+        cmd: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+    - name: Install tools for Docker
+      ansible.builtin.apt:
+        update_cache: yes
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - software-properties-common
+    - name: Download key
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+    - name: Add repo
+      ansible.builtin.apt_repository:
+        repo: "deb https://download.docker.com/linux/ubuntu focal stable"
+        state: present
+    - name: Install Docker
+      ansible.builtin.apt:
+        update_cache: yes
+        name: docker-ce
+    - name: Install ansible
+      ansible.builtin.apt:
+        name:
+          - ansible
+          - sshpass
+
+
+
+- hosts: localhost
+  connection: local
+  tasks:
+    - name: Jenkins worker node
+      ansible.builtin.debug:
+        msg: "Worker node: {{ hostvars['localhost']['slaveIp'] }}"
+    - name: Jenkins master node
+      ansible.builtin.debug:
+        msg: "Master node URL: http://{{ hostvars['localhost']['jenkinsIp'] }}:8080"
